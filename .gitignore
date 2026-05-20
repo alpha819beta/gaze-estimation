@@ -3,6 +3,14 @@ data/MPIIFaceGaze
 output/
 *.pt
 *.onnx
+!weights/.gitkeep
+!weights/README.md
+
+# Generated / local artifacts
+output.mp4
+*.rar
+gaze-estimation.rar
+inference (1).py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
