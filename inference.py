@@ -1,167 +1,165 @@
-import cv2
-import logging
-import argparse
-import warnings
-import numpy as np
+#!/usr/bin/env python3
+"""Gaze estimation on webcam or video (PyTorch)."""
 
+import argparse
+import logging
+import warnings
+
+import cv2
+import numpy as np
 import torch
-import torch.nn.functional as F
-from torchvision import transforms
 
 from config import data_config
-from utils.helpers import get_model, draw_bbox_gaze
-
-from uniface import RetinaFace
+from utils.gaze_runtime import (
+    FacePreprocessor,
+    GazeSmoother,
+    create_face_detector,
+    crop_face,
+    decode_gaze,
+    default_weight_path,
+    load_gaze_model,
+    open_video_source,
+    resolve_dataset_config,
+)
+from utils.helpers import draw_bbox_gaze
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Gaze estimation inference")
-    parser.add_argument("--model", type=str, default="resnet34", help="Model name, default `resnet18`")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="resnet34",
+        help="Architecture: resnet18/34/50, mobilenetv2, mobileone_s0",
+    )
     parser.add_argument(
         "--weight",
         type=str,
-        default="resnet34.pt",
-        help="Path to gaze esimation model weights",
+        default="",
+        help="Path to .pt weights (default: weights/<model>.pt)",
     )
-    parser.add_argument(
-        "--view",
-        action="store_true",
-        default=False,
-        help="Display the inference results",
-    )
+    parser.add_argument("--view", action="store_true", help="Show live preview window")
     parser.add_argument(
         "--source",
         type=str,
         default="assets/in_video.mp4",
-        help="Path to source video file or camera index",
+        help="Video path or camera index (e.g. 0)",
     )
-    parser.add_argument("--output", type=str, default="output.mp4", help="Path to save output file")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="",
+        help="Save annotated video to this path",
+    )
     parser.add_argument(
         "--dataset",
         type=str,
         default="gaze360",
-        help="Dataset name to get dataset related configs",
+        choices=list(data_config.keys()),
+        help="Dataset config for angle bins",
+    )
+    parser.add_argument(
+        "--detector",
+        type=str,
+        default="retinaface",
+        choices=["retinaface", "mediapipe"],
+        help="Face detector backend",
+    )
+    parser.add_argument(
+        "--smooth",
+        type=float,
+        default=0.0,
+        metavar="ALPHA",
+        help="Gaze EMA smoothing 0=off, 0.2-0.5 recommended",
+    )
+    parser.add_argument(
+        "--detection-confidence",
+        type=float,
+        default=0.5,
+        help="MediaPipe min detection confidence (ignored for retinaface)",
     )
     args = parser.parse_args()
 
-    # Override default values based on selected dataset
-    if args.dataset in data_config:
-        dataset_config = data_config[args.dataset]
-        args.bins = dataset_config["bins"]
-        args.binwidth = dataset_config["binwidth"]
-        args.angle = dataset_config["angle"]
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset}. Available options: {list(data_config.keys())}")
+    cfg = resolve_dataset_config(args.dataset)
+    args.bins = cfg["bins"]
+    args.binwidth = cfg["binwidth"]
+    args.angle = cfg["angle"]
+
+    if not args.weight:
+        args.weight = str(default_weight_path(args.model))
 
     return args
 
 
-def pre_process(image):
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    transform = transforms.Compose(
-        [
-            transforms.ToPILImage(),
-            transforms.Resize(448),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-
-    image = transform(image)
-    image_batch = image.unsqueeze(0)
-    return image_batch
-
-
 def main(params):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Device: %s", device)
 
     idx_tensor = torch.arange(params.bins, device=device, dtype=torch.float32)
+    preprocessor = FacePreprocessor()
+    smoother = GazeSmoother(params.smooth) if params.smooth > 0 else None
 
-    face_detector = RetinaFace()  # third-party face detection library
+    face_detector = create_face_detector(
+        params.detector,
+        min_confidence=params.detection_confidence,
+    )
+    gaze_model = load_gaze_model(params.model, params.weight, params.bins, device)
 
-    try:
-        gaze_detector = get_model(params.model, params.bins, inference_mode=True)
-        state_dict = torch.load(params.weight, map_location=device)
-        gaze_detector.load_state_dict(state_dict)
-        logging.info("Gaze Estimation model weights loaded.")
-    except Exception as e:
-        logging.info(f"Exception occured while loading pre-trained weights of gaze estimation model. Exception: {e}")
-        raise FileNotFoundError(f"Model weights not found at {params.weight}") from e
-
-    gaze_detector.to(device)
-    gaze_detector.eval()
-
-    video_source = params.source
-    if video_source.isdigit() or video_source == "0":
-        cap = cv2.VideoCapture(int(video_source))
-    else:
-        cap = cv2.VideoCapture(video_source)
-
+    cap = open_video_source(params.source)
+    writer = None
     if params.output:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(params.output, fourcc, cap.get(cv2.CAP_PROP_FPS), (width, height))
+        writer = cv2.VideoWriter(params.output, fourcc, fps, (width, height))
 
-    if not cap.isOpened():
-        raise IOError("Cannot open webcam")
-
-    with torch.no_grad():
-        while True:
-            success, frame = cap.read()
-
-            if not success:
-                logging.info("Failed to obtain frame or EOF")
-                break
-
-            faces = face_detector.detect(frame)
-            for face in faces:
-                bbox = face["bbox"]
-                x_min, y_min, x_max, y_max = map(int, bbox[:4])
-
-                image = frame[y_min:y_max, x_min:x_max]
-                image = pre_process(image)
-                image = image.to(device)
-
-                pitch, yaw = gaze_detector(image)
-
-                pitch_predicted, yaw_predicted = (
-                    F.softmax(pitch, dim=1),
-                    F.softmax(yaw, dim=1),
-                )
-
-                # Mapping from binned (0 to 90) to angles (-180 to 180) or (0 to 28) to angles (-42, 42)
-                pitch_predicted = torch.sum(pitch_predicted * idx_tensor, dim=1) * params.binwidth - params.angle
-                yaw_predicted = torch.sum(yaw_predicted * idx_tensor, dim=1) * params.binwidth - params.angle
-
-                # Degrees to Radians
-                pitch_predicted = np.radians(pitch_predicted.cpu())
-                yaw_predicted = np.radians(yaw_predicted.cpu())
-
-                # draw box and gaze direction
-                draw_bbox_gaze(frame, bbox, pitch_predicted, yaw_predicted)
-
-            if params.output:
-                out.write(frame)
-
-            if params.view:
-                cv2.imshow("Demo", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+    try:
+        with torch.no_grad():
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    logger.info("End of stream or read failure")
                     break
 
-    cap.release()
-    if params.output:
-        out.release()
-    cv2.destroyAllWindows()
+                faces = face_detector.detect(frame)
+                for face in faces:
+                    bbox = face["bbox"]
+                    crop = crop_face(frame, bbox)
+                    if crop is None:
+                        continue
+
+                    batch = preprocessor(crop).to(device)
+                    pitch_logits, yaw_logits = gaze_model(batch)
+                    pitch, yaw = decode_gaze(
+                        pitch_logits, yaw_logits, idx_tensor, params.binwidth, params.angle
+                    )
+                    if smoother is not None:
+                        pitch, yaw = smoother.apply(bbox, pitch, yaw)
+
+                    draw_bbox_gaze(frame, bbox, np.array(pitch), np.array(yaw))
+
+                if writer is not None:
+                    writer.write(frame)
+                if params.view:
+                    cv2.imshow("Gaze estimation", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+        if hasattr(face_detector, "close"):
+            face_detector.close()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
     args = parse_args()
-
     if not args.view and not args.output:
-        raise Exception("At least one of --view or --ouput must be provided.")
-
+        raise SystemExit("Provide at least one of --view or --output")
     main(args)
