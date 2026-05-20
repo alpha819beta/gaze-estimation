@@ -1,0 +1,7 @@
+onnxruntime==1.19.0
+opencv-python==4.10.0.84
+pillow==10.2.0
+torch==2.6.0+cu126
+torchvision==0.21.0+cu126
+tqdm==4.66.5
+uniface==1.1.0
